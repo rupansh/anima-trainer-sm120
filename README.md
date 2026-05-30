@@ -14,7 +14,7 @@ PS: I didn't write a single line of code for this project and plan to keep it th
 ## Install
 
 ```bash
-git clone <repo>
+git clone --recurse-submodules https://github.com/rupansh/anima-trainer-sm120
 cd anima-trainer
 uv sync
 ```
