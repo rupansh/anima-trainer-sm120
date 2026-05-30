@@ -1,0 +1,9 @@
+sd-scripts-venv
+.venv
+outputs/*
+!outputs/.gitkeep
+*.toml
+!melted1.toml
+models/*
+!models/.gitkeep
+__pycache__
