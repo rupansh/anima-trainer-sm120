@@ -1,0 +1,175 @@
+[project]
+name = "anima-trainer"
+version = "0.1.0"
+description = "Fast LoKr trainer for the Anima DiT image model, targeting Blackwell sm120"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.12.0",
+    "safetensors>=0.4",
+    "lancedb>=0.13",
+    "pyarrow>=17",
+    "xxhash>=3.5",
+    "pillow>=10",
+    "numpy>=2.0",
+    "tqdm>=4.66",
+    "tomli>=2.0; python_version<'3.11'",
+    # IMPORTANT: pypi's lycoris-lora 3.4.0 does NOT support Anima (its `full`
+    # preset only matches FinalLayer → 3 modules / 26K params). The git HEAD
+    # has the Anima patterns (454 modules / 30.6M params). Pinned to commit
+    # 5ec93d2 for reproducibility — bump deliberately when LyCORIS releases
+    # a new tagged version that actually carries the Anima patterns.
+    "lycoris-lora @ git+https://github.com/KohakuBlueLeaf/LyCORIS.git@5ec93d24fcb8f27d6b16d3d706e69c60404d4b39",
+    "prodigy-plus-schedule-free>=2.0",
+    "accelerate>=1.0",
+    "transformers>=4.50",
+    "tokenizers>=0.20",
+    "smartcrop>=0.4",
+    "einops>=0.8",
+    # Liger fused RMSNorm kernel — imported at training time by liger_patch.py.
+    "liger-kernel>=0.8",
+    # LPIPS metric for `anima-train eval-compare` (transitively pulls torchvision).
+    "lpips>=0.1.4",
+    # torchvision is pulled by lpips but we declare it here so uv pins it to
+    # the same pytorch-nightly-cu130 index as torch (default pypi has only
+    # cu12.x stable wheels, which would conflict with our cu13 torch).
+    "torchvision",
+    # triton is a transitive dep of torch nightly but the nightly index
+    # publishes a *custom-built* triton (`3.7.0+git<hash>`) that pypi does
+    # not have. Declaring it here lets uv resolve it from the nightly index.
+    "triton",
+    # diffusers is imported transitively when we use sd-scripts' library
+    # via `sdscripts_bridge.ensure_on_path()` — `library.utils` imports
+    # `EulerAncestralDiscreteScheduler` at module load, which fires before
+    # any of our own training code runs.
+    "diffusers>=0.30",
+    # cv2 is imported by sd-scripts/library/utils.py at module load too.
+    "opencv-python>=4.10",
+    # imagesize is imported by sd-scripts/library/train_util.py, which the
+    # text-encoding strategy pulls in transitively.
+    "imagesize>=1.4",
+    # TransformerEngine for MXFP8 frozen-base training (precision="mxfp8").
+    # We bypass `te.Linear` and call the low-level MXFP8 GEMM directly
+    # (`tex.general_gemm`) — te.Linear's autograd hits CUBLAS_STATUS_NOT_SUPPORTED
+    # on sm_120 for the dgrad layout (cuBLAS lacks the heuristic for the
+    # backward-transposed MXFP8 GEMM as of cuBLAS 13.5). Since LoKr's base
+    # weight is *frozen*, we don't need MXFP8 backward: forward runs MXFP8
+    # GEMM via the working layout, backward dgrad runs bf16 against a cached
+    # bf16 copy of the weight. The `check_mxfp8_support()` gate is also
+    # patched out — see fp8_quant.py for the rationale and verified gate
+    # bypass.
+    "transformer-engine[pytorch]>=2.15",
+    # `transformer-engine-torch` declared explicitly so the
+    # `[tool.uv.sources]` git override below applies (uv's source remapping
+    # only works for direct project deps, not transitive ones). The pypi
+    # `transformer-engine-cu13` wheel is kept as-is — only `-torch` has the
+    # broken sdist that motivates the git override.
+    "transformer-engine-torch>=2.15",
+    # `nvidia-cuda-crt` ships `nvidia/cu13/include/crt/host_defines.h`;
+    # `nvidia-cuda-runtime-cu13` (transitively pulled by torch) only puts
+    # `host_defines.h` at the flat include root. TE's source `#include
+    # <crt/host_defines.h>` needs the subdir layout. Listed as a runtime
+    # dep because uv's `extra-build-dependencies` is ignored under
+    # `--no-build-isolation` (the build env IS the project env), so the
+    # only way to guarantee it's present at build time is to make it
+    # resident in the project env.
+    "nvidia-cuda-crt",
+    # Same logic for `pybind11`: TE's `build-system.requires` lists it but
+    # `--no-build-isolation` skips installing build-system.requires.
+    "pybind11",
+    # cublasLt 13.4+ has the `cublasLtGroupedMatrixLayoutInit_internal`
+    # symbol that the TE 2.15 wheel was built against. PyTorch nightly cu130
+    # ships nvidia-cublas 13.1 which is missing the symbol → undefined-symbol
+    # OSError on TE import. CUDA 13.x is ABI-stable within the major so
+    # PyTorch 13.0/13.1 + cublas 13.4+ run fine together. Pin to >=13.4.1.
+    "nvidia-cublas>=13.4.1",
+]
+
+[project.scripts]
+anima-train = "anima_trainer.cli:main"
+
+[tool.uv]
+package = true
+# All torch/torchvision builds for cu130 are pre-releases (.devN suffix).
+# Without this, `uv sync` would refuse to resolve them and demand
+# --prerelease=allow as a side command.
+prerelease = "allow"
+# Force uv to resolve against linux/x86_64 only — otherwise the resolver
+# tries to find a torch nightly that *also* has aarch64 + win_amd64 wheels
+# (PyTorch's nightly publication schedule is per-day, per-platform and not
+# uniform; many days only ship linux/x86_64 cu130 wheels). `environments`
+# limits the resolution universe; `required-environments` would only assert
+# the lockfile *must* support those and still try to resolve everything.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# `transformer-engine-torch` builds from source (no prebuilt wheels exist —
+# only `transformer-engine-cu13` ships binaries). For the source build to
+# succeed inside `uv sync`, three things have to line up:
+#   1. Build isolation OFF so the build sees installed torch headers and
+#      can call `torch.utils.cpp_extension`.
+#   2. `NVTE_BUILD_USE_NVIDIA_WHEELS=1` so TE finds cudnn/nccl/nvshmem from
+#      the pip-installed nvidia wheels instead of looking for /usr/include.
+#   3. The extra build dep `nvidia-cuda-crt` ships
+#      `nvidia/cu13/include/crt/host_defines.h` — `nvidia-cuda-runtime-cu13`
+#      ships those headers flat (no `crt/` subdir) and TE's source does
+#      `#include <crt/host_defines.h>`. Adding this build dep removes any
+#      reliance on a system CUDA toolkit at /opt/cuda.
+# Source comes from git (see `[tool.uv.sources]`) because pypi's sdist for
+# this package is missing the `build_tools/` directory.
+no-build-isolation-package = ["transformer-engine-torch"]
+# torch nightly cu130 declares a tight cublas pin (13.1.x range), but
+# cublas 13.x is ABI-stable within the major and TE 2.15 *requires* cublas
+# >= 13.4.1 (links to `cublasLtGroupedMatrixLayoutInit_internal`, missing
+# from 13.1). Override torch's claim. Must live under [tool.uv] (above any
+# sub-table) due to TOML scoping.
+override-dependencies = ["nvidia-cublas>=13.4.1"]
+
+[tool.uv.extra-build-variables]
+# NVTE_BUILD_USE_NVIDIA_WHEELS=1 makes TE find cudnn/nccl/nvshmem headers
+# from the pip-installed nvidia wheels instead of /usr/include.
+# NVTE_CUDA_ARCHS=120 builds only sm_120 kernels (our only target).
+# NVTE_NO_LOCAL_VERSION=1 strips the PEP 440 `+<sha>` suffix that the git
+# build would otherwise add — TE's runtime asserts strict version-string
+# equality across `transformer-engine`, `transformer-engine-torch`, and
+# `transformer-engine-cu13`, and the other two are pypi 2.15.0 (no +sha).
+"transformer-engine-torch" = { NVTE_BUILD_USE_NVIDIA_WHEELS = "1", NVTE_CUDA_ARCHS = "120", NVTE_NO_LOCAL_VERSION = "1" }
+
+# Blackwell sm120 needs CUDA 13.x wheels, which are only published to the
+# PyTorch nightly index — pypi only carries stable cu12.x. Pinning the index
+# here so `uv sync` produces a working install reproducibly.
+[[tool.uv.index]]
+name = "pytorch-nightly-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-nightly-cu130" }
+torchvision = { index = "pytorch-nightly-cu130" }
+triton = { index = "pytorch-nightly-cu130" }
+# The pypi `transformer-engine-torch==2.15.0` sdist is missing the
+# `build_tools/` directory that its own setup.py expects at `parent.parent`
+# (TE's monorepo layout: `transformer_engine/pytorch/setup.py` reaches up
+# to the repo-root `build_tools/`). Pip/uv builds fail with
+# `ModuleNotFoundError: No module named 'build_tools'`. Pinning to the git
+# subdir brings build_tools along (the full repo is checked out; uv builds
+# only the requested subdirectory).
+#
+# We keep `transformer-engine` (meta) and `transformer-engine-cu13` (the
+# prebuilt manylinux wheel with all the C++ kernels) on pypi, so this is
+# the only source override. The TE runtime asserts version-string equality
+# across all three packages — git builds normally stamp a PEP 440 local
+# version `2.15.0+<sha>` which would break the equality, so
+# `NVTE_NO_LOCAL_VERSION=1` (see `extra-build-variables` below) is set to
+# strip the `+sha` and produce a clean `2.15.0` that matches the pypi pair.
+transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.15", subdirectory = "transformer_engine/pytorch" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/anima_trainer"]
+
+# lycoris-lora is pinned to a git commit (see [project.dependencies] comment);
+# hatchling otherwise refuses to build with direct URLs in dependencies.
+[tool.hatch.metadata]
+allow-direct-references = true

@@ -4,6 +4,7 @@ outputs/*
 !outputs/.gitkeep
 *.toml
 !melted1.toml
+!pyproject.toml
 models/*
 !models/.gitkeep
 __pycache__
