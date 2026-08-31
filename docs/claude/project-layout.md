@@ -11,6 +11,8 @@ Built:
   - `model.py` — loads DiT + Qwen3 + VAE via sd-scripts; returns a `LoadedModels`.
   - `lokr.py` — wraps the DiT with `lycoris.kohya`. Registers the `anima-full` and `anima-cross-mlp` presets; flips `LycorisNetworkKohya.USE_FNMATCH = True` for fnmatch globs.
   - `lokr_patch.py` — monkey-patches `LokrModule.forward` to merge `base_W + alpha*diff_W` into a single matmul per LokrModule.
+  - `tlokr.py` — timestep-aware LoKr conversion, shared rank-schedule context, structured autograd, strict checkpoint marker, and the FP8 factor path.
+  - `tlokr_kernels.py` — fused Triton rank-mask/small-Kronecker forward, dgrad, and fp32-reduction wgrad kernels used by T-LoKr.
   - `liger_patch.py` — monkey-patches Anima's `RMSNorm.forward` to use `LigerRMSNormFunction` (fp32 stats, bf16 weight multiply, single fused Triton kernel).
   - `adaln_patch.py` — monkey-patches `Block._forward` to call the custom Triton kernel from `adaln_kernel.py` (LayerNorm + (1+scale)*x + shift) instead of the inline lambda. Replaces the older `torch.compile` path.
   - `adaln_kernel.py` — custom Triton kernels (forward + dx + dscale/dshift) and `FusedAdaLN(torch.autograd.Function)` wrapper for the AdaLN fusion.

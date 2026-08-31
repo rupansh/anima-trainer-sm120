@@ -5,7 +5,10 @@ description = "Fast LoKr trainer for the Anima DiT image model, targeting Blackw
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "torch>=2.12.0",
+    # Keep torch and Transformer Engine on the jointly verified August stack.
+    # The older combination required overriding torch's CUDA-library metadata;
+    # this build instead lets uv resolve one internally consistent cu130 family.
+    "torch>=2.15.0.dev20260830",
     "safetensors>=0.4",
     "lancedb>=0.13",
     "pyarrow>=17",
@@ -35,7 +38,7 @@ dependencies = [
     # cu12.x stable wheels, which would conflict with our cu13 torch).
     "torchvision",
     # triton is a transitive dep of torch nightly but the nightly index
-    # publishes a *custom-built* triton (`3.7.0+git<hash>`) that pypi does
+    # publishes a *custom-built* triton (`3.x+git<hash>`) that pypi does
     # not have. Declaring it here lets uv resolve it from the nightly index.
     "triton",
     # diffusers is imported transitively when we use sd-scripts' library
@@ -58,31 +61,23 @@ dependencies = [
     # bf16 copy of the weight. The `check_mxfp8_support()` gate is also
     # patched out — see fp8_quant.py for the rationale and verified gate
     # bypass.
-    "transformer-engine[pytorch]>=2.15",
+    "transformer-engine[pytorch]>=2.18",
     # `transformer-engine-torch` declared explicitly so the
     # `[tool.uv.sources]` git override below applies (uv's source remapping
     # only works for direct project deps, not transitive ones). The pypi
     # `transformer-engine-cu13` wheel is kept as-is — only `-torch` has the
     # broken sdist that motivates the git override.
-    "transformer-engine-torch>=2.15",
-    # `nvidia-cuda-crt` ships `nvidia/cu13/include/crt/host_defines.h`;
-    # `nvidia-cuda-runtime-cu13` (transitively pulled by torch) only puts
-    # `host_defines.h` at the flat include root. TE's source `#include
-    # <crt/host_defines.h>` needs the subdir layout. Listed as a runtime
-    # dep because uv's `extra-build-dependencies` is ignored under
-    # `--no-build-isolation` (the build env IS the project env), so the
-    # only way to guarantee it's present at build time is to make it
-    # resident in the project env.
-    "nvidia-cuda-crt",
+    "transformer-engine-torch>=2.18",
+    # TE's source build needs CUDA's CRT and CCCL header layouts
+    # (`crt/host_defines.h` and `nv/target`). Torch's runtime extras do not
+    # install either one. Keep them on the same CUDA 13.0 toolkit line as
+    # the cu130 torch wheel instead of resolving independent, newer header
+    # packages. These are project deps because --no-build-isolation makes
+    # the project environment the TE build environment.
+    "cuda-toolkit[cccl,crt]>=13.0,<13.1",
     # Same logic for `pybind11`: TE's `build-system.requires` lists it but
     # `--no-build-isolation` skips installing build-system.requires.
     "pybind11",
-    # cublasLt 13.4+ has the `cublasLtGroupedMatrixLayoutInit_internal`
-    # symbol that the TE 2.15 wheel was built against. PyTorch nightly cu130
-    # ships nvidia-cublas 13.1 which is missing the symbol → undefined-symbol
-    # OSError on TE import. CUDA 13.x is ABI-stable within the major so
-    # PyTorch 13.0/13.1 + cublas 13.4+ run fine together. Pin to >=13.4.1.
-    "nvidia-cublas>=13.4.1",
 ]
 
 [project.scripts]
@@ -93,7 +88,7 @@ package = true
 # All torch/torchvision builds for cu130 are pre-releases (.devN suffix).
 # Without this, `uv sync` would refuse to resolve them and demand
 # --prerelease=allow as a side command.
-prerelease = "allow"
+prerelease = "if-necessary"
 # Force uv to resolve against linux/x86_64 only — otherwise the resolver
 # tries to find a torch nightly that *also* has aarch64 + win_amd64 wheels
 # (PyTorch's nightly publication schedule is per-day, per-platform and not
@@ -108,21 +103,13 @@ environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 #      can call `torch.utils.cpp_extension`.
 #   2. `NVTE_BUILD_USE_NVIDIA_WHEELS=1` so TE finds cudnn/nccl/nvshmem from
 #      the pip-installed nvidia wheels instead of looking for /usr/include.
-#   3. The extra build dep `nvidia-cuda-crt` ships
-#      `nvidia/cu13/include/crt/host_defines.h` — `nvidia-cuda-runtime-cu13`
-#      ships those headers flat (no `crt/` subdir) and TE's source does
-#      `#include <crt/host_defines.h>`. Adding this build dep removes any
-#      reliance on a system CUDA toolkit at /opt/cuda.
+#   3. The CUDA toolkit `crt` and `cccl` extras supply the source-only header
+#      layouts TE consumes (`crt/host_defines.h` and `nv/target`). Adding
+#      these build deps removes any reliance on a system CUDA toolkit at
+#      /opt/cuda.
 # Source comes from git (see `[tool.uv.sources]`) because pypi's sdist for
 # this package is missing the `build_tools/` directory.
 no-build-isolation-package = ["transformer-engine-torch"]
-# torch nightly cu130 declares a tight cublas pin (13.1.x range), but
-# cublas 13.x is ABI-stable within the major and TE 2.15 *requires* cublas
-# >= 13.4.1 (links to `cublasLtGroupedMatrixLayoutInit_internal`, missing
-# from 13.1). Override torch's claim. Must live under [tool.uv] (above any
-# sub-table) due to TOML scoping.
-override-dependencies = ["nvidia-cublas>=13.4.1"]
-
 [tool.uv.extra-build-variables]
 # NVTE_BUILD_USE_NVIDIA_WHEELS=1 makes TE find cudnn/nccl/nvshmem headers
 # from the pip-installed nvidia wheels instead of /usr/include.
@@ -130,8 +117,12 @@ override-dependencies = ["nvidia-cublas>=13.4.1"]
 # NVTE_NO_LOCAL_VERSION=1 strips the PEP 440 `+<sha>` suffix that the git
 # build would otherwise add — TE's runtime asserts strict version-string
 # equality across `transformer-engine`, `transformer-engine-torch`, and
-# `transformer-engine-cu13`, and the other two are pypi 2.15.0 (no +sha).
-"transformer-engine-torch" = { NVTE_BUILD_USE_NVIDIA_WHEELS = "1", NVTE_CUDA_ARCHS = "120", NVTE_NO_LOCAL_VERSION = "1" }
+# `transformer-engine-cu13`, and the other two are pypi 2.18.0 (no +sha).
+# Arch's Python sysconfig injects `-flto=auto` into extension builds.  The
+# resulting TE 2.18 module aborts in Py_XDECREF during import, while the same
+# uv build without LTO imports cleanly.  Override it for this package at both
+# compile and link time so every uv build is reproducible.
+"transformer-engine-torch" = { NVTE_BUILD_USE_NVIDIA_WHEELS = "1", NVTE_CUDA_ARCHS = "120", NVTE_NO_LOCAL_VERSION = "1", CFLAGS = "-fno-lto", CXXFLAGS = "-fno-lto", LDFLAGS = "-fno-lto" }
 
 # Blackwell sm120 needs CUDA 13.x wheels, which are only published to the
 # PyTorch nightly index — pypi only carries stable cu12.x. Pinning the index
@@ -145,7 +136,7 @@ explicit = true
 torch = { index = "pytorch-nightly-cu130" }
 torchvision = { index = "pytorch-nightly-cu130" }
 triton = { index = "pytorch-nightly-cu130" }
-# The pypi `transformer-engine-torch==2.15.0` sdist is missing the
+# The pypi `transformer-engine-torch==2.18.0` sdist is missing the
 # `build_tools/` directory that its own setup.py expects at `parent.parent`
 # (TE's monorepo layout: `transformer_engine/pytorch/setup.py` reaches up
 # to the repo-root `build_tools/`). Pip/uv builds fail with
@@ -157,10 +148,10 @@ triton = { index = "pytorch-nightly-cu130" }
 # prebuilt manylinux wheel with all the C++ kernels) on pypi, so this is
 # the only source override. The TE runtime asserts version-string equality
 # across all three packages — git builds normally stamp a PEP 440 local
-# version `2.15.0+<sha>` which would break the equality, so
-# `NVTE_NO_LOCAL_VERSION=1` (see `extra-build-variables` below) is set to
-# strip the `+sha` and produce a clean `2.15.0` that matches the pypi pair.
-transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.15", subdirectory = "transformer_engine/pytorch" }
+# version `2.18.0+<sha>` which would break the equality, so
+# `NVTE_NO_LOCAL_VERSION=1` (see `extra-build-variables` above) is set to
+# strip the `+sha` and produce a clean `2.18.0` that matches the pypi pair.
+transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", tag = "v2.18", subdirectory = "transformer_engine/pytorch" }
 
 [build-system]
 requires = ["hatchling"]

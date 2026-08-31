@@ -1,13 +1,13 @@
-"""Attach a LoKr adapter to the Anima DiT via lycoris.kohya.
+"""Attach a LoKr or timestep-aware T-LoKr adapter to the Anima DiT.
 
 lycoris was originally designed for SD/SDXL UNets but accepts arbitrary
 nn.Modules under its `unet` argument — the term is anatomical, not literal.
 We pass the Anima DiT here. Reference args mirror the baseline:
   algo=lokr, full_matrix=true, factor=8, preset=full
 
-Network dim/alpha match the baseline (128/128). If a profile run shows
-lycoris is the throughput bottleneck, we'll write a sm120-targeted LoKr; until
-then we lean on the reference impl.
+Network dim/alpha match the baseline (128/128). LyCORIS owns module targeting
+and ordinary LoKr; the local T-LoKr path replaces its large Kronecker factor
+with a scheduled rank decomposition and uses a structured forward.
 """
 from __future__ import annotations
 import torch
@@ -84,7 +84,7 @@ def attach_lokr(
     multiplier: float = 1.0,
     text_encoder: Optional[nn.Module] = None,
 ) -> nn.Module:
-    """Wrap the DiT with a LyCORIS LoKr network. Returns the network module.
+    """Wrap the DiT with a LyCORIS LoKr/T-LoKr network.
 
     The returned `network` carries the trainable parameters; you optimize over
     network.parameters() rather than dit.parameters().
@@ -104,6 +104,12 @@ def attach_lokr(
     # too (it doesn't use name patterns).
     LycorisNetworkKohya.USE_FNMATCH = True
 
+    if cfg.variant == "tlokr" and not cfg.full_matrix:
+        raise ValueError(
+            "T-LoKr conversion requires lokr.full_matrix=true so its "
+            "factorized topology is unambiguous"
+        )
+
     network = create_network(
         multiplier,
         network_dim,
@@ -121,6 +127,15 @@ def attach_lokr(
         # noise, ~17% MORE peak VRAM. The lycoris materialize-then-linear path
         # is already efficient on Anima's shapes.
     )
+    if cfg.variant == "tlokr":
+        from .tlokr import convert_network
+
+        converted = convert_network(
+            network,
+            rank=network_dim,
+            min_rank_ratio=cfg.timestep_min_rank_ratio,
+        )
+        network._tlokr_converted_modules = converted
     network.apply_to(text_encoder, dit, apply_text_encoder=False, apply_unet=True)
     network.requires_grad_(True)
     return network

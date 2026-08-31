@@ -110,7 +110,7 @@ class Cache:
         self._t_text = self._open_or_create("text_embeds", TEXT_EMBEDS_SCHEMA)
 
     def _open_or_create(self, name: str, schema: pa.Schema):
-        if name in self.db.table_names():
+        if name in self.db.list_tables().tables:
             return self.db.open_table(name)
         return self.db.create_table(name, schema=schema)
 

@@ -36,6 +36,8 @@ from anima_trainer.adaln_patch import install as install_adaln_patch
 from anima_trainer.rope_patch import install as install_rope_patch
 from anima_trainer.adaln_merge import merge_adaln_modulation
 from anima_trainer.cuda_graphs import CUDAGraphRunner, make_bucket_key
+from anima_trainer.tlokr import clear_timestep as clear_tlokr_timestep
+from anima_trainer.tlokr import set_timestep as set_tlokr_timestep
 
 
 def main():
@@ -92,7 +94,7 @@ def main():
     print(f"  merged AdaLN-mod : {n_merged} blocks")
 
     network = attach_lokr(models.dit, cfg.lokr, network_dim=128, network_alpha=128.0).to(device)
-    print(f"  LoKr params     : {trainable_param_count(network):,}")
+    print(f"  {cfg.lokr.variant} params     : {trainable_param_count(network):,}")
     if cfg.train.gradient_checkpointing and hasattr(models.dit, "enable_gradient_checkpointing"):
         models.dit.enable_gradient_checkpointing()
 
@@ -101,11 +103,19 @@ def main():
         skip_set = collect_lokr_wrapped_linears(network)
         quantize_frozen_linears(models.dit, skip=skip_set)
     elif cfg.train.precision == "fp8":
-        from anima_trainer.fp8_quant import swap_frozen_linears_to_te, collect_lokr_wrapped_linears, patch_anima_checkpoint_for_fp8
-        from anima_trainer.lokr_patch import enable_fp8 as enable_lokr_fp8
+        from anima_trainer.fp8_quant import (
+            swap_frozen_linears_to_te,
+            collect_lokr_wrapped_linears,
+            patch_anima_checkpoint_for_fp8,
+            quantize_tlokr_base_weights,
+        )
         skip_set = collect_lokr_wrapped_linears(network)
         swap_frozen_linears_to_te(models.dit, skip=skip_set)
-        enable_lokr_fp8(network)
+        if cfg.lokr.variant == "tlokr":
+            quantize_tlokr_base_weights(network)
+        else:
+            from anima_trainer.lokr_patch import enable_fp8 as enable_lokr_fp8
+            enable_lokr_fp8(network)
         if cfg.train.gradient_checkpointing:
             patch_anima_checkpoint_for_fp8()
     quantize_dit_in_place(models.dit, cfg.train.precision)
@@ -129,6 +139,8 @@ def main():
         return enc["input_ids"].to(device, dtype=torch.long), enc["attention_mask"].to(device)
 
     def _forward_and_loss(static_batch):
+        if cfg.lokr.variant == "tlokr":
+            set_tlokr_timestep(static_batch["timesteps"])
         with autocast_for(cfg.train.precision), sm120_sdpa(), fp8_autocast_for(cfg.train.precision):
             pred = models.dit(
                 static_batch["noisy"], static_batch["timesteps"], static_batch["prompt_embeds"],
@@ -176,12 +188,16 @@ def main():
         t0 = time.perf_counter()
 
         optim.zero_grad(set_to_none=use_set_to_none)
-        if runner is not None:
-            key = make_bucket_key(latents, t5_ids)
-            loss = runner.step(key, static_batch, list(network.parameters()))
-        else:
-            loss = _forward_and_loss(static_batch)
-            loss.backward()
+        try:
+            if runner is not None:
+                key = make_bucket_key(latents, t5_ids)
+                loss = runner.step(key, static_batch, list(network.parameters()))
+            else:
+                loss = _forward_and_loss(static_batch)
+                loss.backward()
+        finally:
+            if cfg.lokr.variant == "tlokr":
+                clear_tlokr_timestep()
         torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
         optim.step()
         torch.cuda.synchronize()

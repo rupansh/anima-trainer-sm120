@@ -18,6 +18,11 @@ class LokrCfg:
     factor: int = 8           # `factor` in lycoris.kohya algo=lokr
     full_matrix: bool = True
     preset: str = "full"
+    variant: Literal["lokr", "tlokr"] = "lokr"
+    # Vanilla T-LoRA's linear rank schedule, applied to LoKr's large
+    # factorization rank. At t=1 (maximum noise) this fraction is active;
+    # at t=0 all ranks are active.
+    timestep_min_rank_ratio: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,40 @@ def load(path: str | Path) -> Config:
     )
     if cfg.train.resolution not in (512, 1024):
         raise ValueError(f"resolution must be 512 or 1024; got {cfg.train.resolution}")
+    if cfg.train.batch_size <= 0:
+        raise ValueError(f"batch_size must be positive; got {cfg.train.batch_size}")
+    if cfg.train.max_train_epochs <= 0:
+        raise ValueError(
+            f"max_train_epochs must be positive; got {cfg.train.max_train_epochs}"
+        )
+    if cfg.train.save_every_n_epochs <= 0:
+        raise ValueError(
+            "save_every_n_epochs must be positive; got "
+            f"{cfg.train.save_every_n_epochs}"
+        )
+    if cfg.train.num_workers < 0:
+        raise ValueError(f"num_workers cannot be negative; got {cfg.train.num_workers}")
+    if cfg.train.cuda_graph_warmup_steps < 0:
+        raise ValueError(
+            "cuda_graph_warmup_steps cannot be negative; got "
+            f"{cfg.train.cuda_graph_warmup_steps}"
+        )
+    if cfg.sample.every_n_epochs < 0:
+        raise ValueError(
+            f"sample.every_n_epochs cannot be negative; got {cfg.sample.every_n_epochs}"
+        )
+    if cfg.lokr.factor <= 0:
+        raise ValueError(f"lokr.factor must be positive; got {cfg.lokr.factor}")
+    if cfg.lokr.variant not in ("lokr", "tlokr"):
+        raise ValueError(
+            "lokr.variant must be 'lokr' or 'tlokr'; got "
+            f"{cfg.lokr.variant!r}"
+        )
+    if not 0.0 < cfg.lokr.timestep_min_rank_ratio <= 1.0:
+        raise ValueError(
+            "lokr.timestep_min_rank_ratio must be in (0, 1]; got "
+            f"{cfg.lokr.timestep_min_rank_ratio}"
+        )
     return cfg
 
 

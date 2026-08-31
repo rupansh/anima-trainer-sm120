@@ -141,7 +141,10 @@ def scan_dataset(root: str | Path) -> List[Sample]:
             repeats = int(repeats_s)
         except ValueError:
             continue
-        for img in sub.iterdir():
+        # Stable file ordering is part of the resumable batch-plan contract.
+        # Filesystem iteration order can change after directory edits or a
+        # reboot even when the dataset contents are identical.
+        for img in sorted(sub.iterdir()):
             if img.suffix.lower() not in (".png", ".jpg", ".jpeg"):
                 continue
             cap_path = img.with_suffix(".txt")

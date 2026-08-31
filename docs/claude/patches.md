@@ -26,6 +26,28 @@ Verified loss values are bit-identical to the stock lycoris path across the
 first 21 steps (same math, fewer ops). VRAM is *lower* than stock too — no
 intermediate `new_weight` tensor materialized.
 
+## Timestep-aware structured LoKr (`src/anima_trainer/tlokr.py`)
+
+`lokr.variant = "tlokr"` converts each freshly-created full-matrix LyCORIS
+wrapper before `apply_to()`. The small Kronecker operand remains full while
+the large operand becomes `A @ B`; a per-example prefix mask implements
+Vanilla T-LoRA's linear rank schedule. One context-local mask is shared across
+all 168 adapters in a DiT pass, including activation-checkpoint recomputation.
+
+The adapter path never constructs `A @ B` or the full Kronecker delta. A custom
+autograd function recomputes the small intermediates and uses structured GEMMs.
+Aligned large-factor forward, dgrad, and wgrad operations use Transformer
+Engine block-scaled FP8. `tlokr_kernels.py` fuses rank masking with the 8x8
+small-factor projection for forward and dgrad, and fuses the corresponding
+fp32 weight-gradient reduction. Euler sampling supplies its scalar timestep as
+host metadata, allowing inactive A/B columns to be sliced away without a GPU
+synchronization or mask kernel.
+
+Checkpoint state carries `[format_version, max_rank, min_rank]` as a persistent
+integer tensor. The normal strict load path therefore rejects an ordinary LoKr
+checkpoint or a differently scheduled T-LoKr checkpoint instead of accepting a
+partial state silently.
+
 **Whole-DiT compile is not needed**: the merged-weight patch in eager mode
 hits exactly the same step time (3.65 s, pre-AdaLN) as the
 `compile_mode="default"` whole-DiT compile, without the 77 GB VRAM peak or

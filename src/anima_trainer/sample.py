@@ -26,6 +26,8 @@ import torch
 
 from .sdscripts_bridge import ensure_on_path
 from .precision import fp8_autocast_for
+from .tlokr import clear_timestep as clear_tlokr_timestep
+from .tlokr import set_timestep as set_tlokr_timestep
 
 
 # ---- prompt parsing --------------------------------------------------------
@@ -178,13 +180,25 @@ def euler_denoise(
     # user prompts are all 1024-scale, we keep the sequential path.
     for i in range(steps):
         t = sigmas[i].unsqueeze(0)
-        with fp8_autocast_for(precision):
-            if use_cfg:
-                pos = dit(x, t, crossattn_emb, padding_mask=padding_mask).float()
-                neg = dit(x, t, neg_crossattn_emb, padding_mask=padding_mask).float()
-                model_out = neg + cfg * (pos - neg)
-            else:
-                model_out = dit(x, t, crossattn_emb, padding_mask=padding_mask).float()
+        # The Euler schedule is uniform before flow shifting. Supplying the
+        # equivalent Python scalar lets T-LoKr slice its factors at batch=1
+        # without synchronizing on ``t.item()`` or computing masked ranks.
+        t_scalar = 1.0 - (i / steps)
+        if flow_shift != 1.0:
+            t_scalar = (t_scalar * flow_shift) / (
+                1.0 + (flow_shift - 1.0) * t_scalar
+            )
+        set_tlokr_timestep(t, uniform_timestep=t_scalar)
+        try:
+            with fp8_autocast_for(precision):
+                if use_cfg:
+                    pos = dit(x, t, crossattn_emb, padding_mask=padding_mask).float()
+                    neg = dit(x, t, neg_crossattn_emb, padding_mask=padding_mask).float()
+                    model_out = neg + cfg * (pos - neg)
+                else:
+                    model_out = dit(x, t, crossattn_emb, padding_mask=padding_mask).float()
+        finally:
+            clear_tlokr_timestep()
         dt = sigmas[i + 1] - sigmas[i]
         x = x + (model_out * dt).to(dtype)
     return x

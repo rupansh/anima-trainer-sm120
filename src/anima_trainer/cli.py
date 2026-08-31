@@ -20,6 +20,20 @@ def main(argv: list[str] | None = None) -> int:
     s_pre.add_argument("config", type=Path)
     s_train = sub.add_parser("train", help="run training")
     s_train.add_argument("config", type=Path)
+    resume_group = s_train.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help="restore compatible cached training state without prompting",
+    )
+    resume_group.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="start fresh and quarantine any compatible cached state",
+    )
+    s_train.set_defaults(resume=None)
     s_eval = sub.add_parser("eval-compare", help="pairwise compare two sample dirs")
     s_eval.add_argument("dir_a", type=Path)
     s_eval.add_argument("dir_b", type=Path)
@@ -50,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         run(cfg)
     elif args.cmd == "train":
         from .train import train
-        train(cfg)
+        train(cfg, resume=args.resume)
     else:
         raise SystemExit(f"unknown command {args.cmd!r}")
     return 0

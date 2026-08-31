@@ -6,9 +6,7 @@ to the DiT.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from pathlib import Path
 import torch
-import xxhash
 
 from .sdscripts_bridge import ensure_on_path
 from .hashing import file_fingerprint
@@ -25,9 +23,27 @@ class LoadedModels:
     dit_fp: str            # fingerprint of the DiT weights file
 
 
+@dataclass(frozen=True)
+class ModelFingerprints:
+    dit: str
+    vae: str
+    text_encoder: str
+
+
 def _weight_fp(path: str) -> str:
     _, _, h = file_fingerprint(path)
     return h
+
+
+def fingerprint_model_files(
+    *, dit_path: str, qwen3_path: str, vae_path: str
+) -> ModelFingerprints:
+    """Hash model inputs once for cache and resume compatibility checks."""
+    return ModelFingerprints(
+        dit=_weight_fp(dit_path),
+        vae=_weight_fp(vae_path),
+        text_encoder=_weight_fp(qwen3_path),
+    )
 
 
 def load_all(
@@ -39,6 +55,7 @@ def load_all(
     attn_mode: str = "torch",
     device: str = "cuda",
     loading_device: str = "cpu",
+    fingerprints: ModelFingerprints | None = None,
 ) -> LoadedModels:
     """Load Anima DiT + Qwen3 TE + VAE. All frozen."""
     ensure_on_path()
@@ -70,12 +87,19 @@ def load_all(
     )
     dit.requires_grad_(False)  # only LoKr params are trainable; we set them grad-true on attach
 
+    if fingerprints is None:
+        fingerprints = fingerprint_model_files(
+            dit_path=dit_path,
+            qwen3_path=qwen3_path,
+            vae_path=vae_path,
+        )
+
     return LoadedModels(
         dit=dit,
         text_encoder=te,
         tokenizer=tokenizer,
         vae=vae,
-        vae_fp=_weight_fp(vae_path),
-        te_fp=_weight_fp(qwen3_path),
-        dit_fp=_weight_fp(dit_path),
+        vae_fp=fingerprints.vae,
+        te_fp=fingerprints.text_encoder,
+        dit_fp=fingerprints.dit,
     )

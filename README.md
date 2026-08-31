@@ -53,11 +53,15 @@ Edit `melted1.toml` (or copy and edit) — the user-facing knobs are:
 | `train.resolution` | 1024 | 512 or 1024 |
 | `train.batch_size` | 8 | |
 | `train.max_train_epochs` | 15 | |
+| `train.save_every_n_epochs` | 2 | adapter + resumable-state checkpoint cadence |
 | `train.precision` | `"fp8"` | Fast production path; use `"bf16"` as the reference mode |
 | `train.seed` | 42 | |
+| `train.num_workers` | 8 | persistent cache-reader processes; automatically falls back to 0 after an abrupt worker death |
 | `optim.d0` | 5e-05 | Prodigy+SF starting estimate; adapts upward automatically — leave alone |
 | `lokr.preset` | `"anima-cross-mlp"` | `"anima-cross-mlp"` (168 modules, fast) or `"anima-full"` (454 modules, higher capacity) |
 | `lokr.factor` | 8 | LoKr decomposition factor |
+| `lokr.variant` | `"lokr"` | `"lokr"` or timestep-aware `"tlokr"` |
+| `lokr.timestep_min_rank_ratio` | 0.5 | T-LoKr rank fraction used at maximum noise; ignored by ordinary LoKr |
 | `sample.every_n_epochs` | 15 | sampling cadence |
 | `sample.prompts_file` | `./melted1-ds-prompt.txt` | hot-reloaded each tick |
 | `paths.*` | — | DiT/Qwen3/VAE/dataset/output/cache locations |
@@ -75,6 +79,58 @@ uv run anima-train train melted1.toml
 Checkpoints land in `paths.output_dir/`. Samples (if `sample.every_n_epochs` is set) go in `paths.output_dir/samples/`.
 
 To edit sample prompts mid-run: just save `sample.prompts_file` — the next sampling tick reads from disk and picks up the changes.
+
+### Timestep-aware LoKr
+
+Set `lokr.variant = "tlokr"` to apply the vanilla T-LoRA rank schedule to
+LoKr's large Kronecker operand. At noisy flow timesteps only a prefix of the
+factor rank is active; the rank increases linearly toward the clean endpoint.
+`full_matrix = true` is required. The default 0.5 minimum-rank ratio follows
+the paper's recommended schedule.
+
+T-LoKr does not materialize the large LoKr delta. It uses structured factor
+GEMMs, Transformer Engine block-scaled FP8 on aligned production shapes, and
+fused Triton kernels for timestep masking, the small Kronecker projection, and
+its weight gradient. Sampling slices inactive factor columns out entirely.
+Saved adapters include a format marker and schedule parameters, so strict loads
+cannot silently interpret T-LoKr weights as ordinary LoKr.
+
+### Crash recovery
+
+Every adapter checkpoint also publishes a full resumable training state under
+`paths.cache_db/_training_state/`. The adapter is written first, then the
+optimizer, LoKr weights, epoch/global-step position, and Python/NumPy/CPU/CUDA
+RNG states are atomically published. Sampling happens afterward, so a sampling
+failure cannot destroy the checkpoint boundary.
+
+When a compatible state exists, an interactive training run asks whether to
+resume it (default: yes). Automation must make the choice explicit:
+
+```bash
+# Resume without prompting.
+uv run anima-train train melted1.toml --resume
+
+# Deliberately start over and quarantine the previous state.
+uv run anima-train train melted1.toml --no-resume
+```
+
+Compatibility covers model hashes, exact cached latents/text embeddings and
+sample order, training-math settings, LoKr/optimizer settings, and runtime
+versions. Worker count and checkpoint/sample cadence may be changed freely;
+the target epoch may be extended or changed to any value not earlier than the
+cached epoch. Corrupt or incompatible state is
+quarantined and a normal run starts fresh; explicit `--resume` fails instead of
+silently changing trajectory. The active state is removed only after the final
+adapter has been written successfully.
+
+Portable `.safetensors` files contain adapter weights only. A checkpoint made
+before resumable-state support can be used as weights, but cannot reconstruct
+the old optimizer or RNG trajectory exactly.
+
+DataLoader workers persist across epochs. If a worker exits abruptly, training
+reconstructs that epoch's deterministic batch plan, skips batches already
+completed, and permanently continues with `num_workers=0`. Dataset/cache
+exceptions still propagate rather than being mistaken for a dead worker.
 
 ## Prompt syntax
 
@@ -101,6 +157,10 @@ uv run anima-train eval-compare outputs/A/samples outputs/B/samples --vae
 ```
 
 Reports MSE / PSNR / SSIM / LPIPS / VAE-latent cosine per matched (epoch, prompt_idx, seed). `--vae` adds the latent metric (slower — loads the Anima VAE).
+
+See [`docs/tlokr-melted1-fp8-ab.md`](docs/tlokr-melted1-fp8-ab.md) for the
+matched 30-epoch T-LoKr/LoKr run and its throughput, memory, size, convergence,
+and paired-image results.
 
 Convergence metric on a single LoRA checkpoint:
 

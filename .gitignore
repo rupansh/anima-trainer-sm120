@@ -7,4 +7,5 @@ outputs/*
 !pyproject.toml
 models/*
 !models/.gitkeep
+melted1-ds/
 __pycache__

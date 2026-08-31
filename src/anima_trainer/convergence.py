@@ -28,8 +28,13 @@ from .cache import Cache
 from .dataset import scan_dataset
 from .encode import latent_to_tensor
 from .sample import euler_denoise, _encode_via_strategy, _apply_llm_adapter
-from .precision import torch_dtype, quantize_dit_in_place
+from .precision import (
+    torch_dtype,
+    quantize_dit_in_place,
+    fp8_autocast_for,
+)
 from .attention_ctx import sm120_sdpa
+from .hashing import text_digest
 from .sdscripts_bridge import ensure_on_path
 
 
@@ -37,6 +42,11 @@ def _bucket_dims_to_pixels(latent_shape: tuple[int, ...]) -> tuple[int, int]:
     """(C=16, H_lat, W_lat) -> (W_pix, H_pix). VAE spatial downscale = 8."""
     _, h, w = latent_shape
     return w * 8, h * 8
+
+
+def _sample_seed(seed: int, src_path: str) -> int:
+    """Derive reproducible per-source noise without Python's salted hash()."""
+    return seed + int(text_digest(src_path)[:8], 16) % (1 << 30)
 
 
 @torch.no_grad()
@@ -78,11 +88,38 @@ def measure(
     # Load the trained LoRA weights into the network.
     from safetensors.torch import load_file
     sd = load_file(str(lora_path))
-    # Convert any bf16 keys to float and load
-    network.load_state_dict({k: v.to(dtype) for k, v in sd.items()}, strict=False)
+    network.load_state_dict(
+        {
+            k: v.to(dtype) if v.is_floating_point() else v
+            for k, v in sd.items()
+        },
+        strict=True,
+    )
     network.eval()
 
-    # Quantize frozen DiT linears if configured (must happen after LoKr attach).
+    # Recreate the same frozen-base precision paths used during training.
+    if cfg.train.precision == "fp8":
+        from .fp8_quant import (
+            collect_lokr_wrapped_linears,
+            quantize_tlokr_base_weights,
+            swap_frozen_linears_to_te,
+        )
+
+        skip = collect_lokr_wrapped_linears(network)
+        swap_frozen_linears_to_te(models.dit, skip=skip)
+        if cfg.lokr.variant == "tlokr":
+            quantize_tlokr_base_weights(network)
+        else:
+            from .lokr_patch import enable_fp8 as enable_lokr_fp8
+
+            enable_lokr_fp8(network)
+    elif cfg.train.precision == "mxfp8":
+        from .fp8_quant import collect_lokr_wrapped_linears, quantize_frozen_linears
+
+        quantize_frozen_linears(
+            models.dit,
+            skip=collect_lokr_wrapped_linears(network),
+        )
     quantize_dit_in_place(models.dit, cfg.train.precision)
     models.dit.eval()
 
@@ -118,7 +155,8 @@ def measure(
                 device=device,
                 dtype=dtype,
             )
-            cross = _apply_llm_adapter(models.dit, embeds, attn, t5_ids, t5_mask)
+            with fp8_autocast_for(cfg.train.precision):
+                cross = _apply_llm_adapter(models.dit, embeds, attn, t5_ids, t5_mask)
 
             # Sample at the bucket's pixel resolution. Use a fixed seed per
             # sample so noise is reproducible but differs across samples.
@@ -132,9 +170,10 @@ def measure(
                 flow_shift=flow_shift,
                 cfg=cfg_scale,
                 neg_crossattn_emb=None,
-                seed=seed + hash(s.src_path) % (1 << 30),
+                seed=_sample_seed(seed, s.src_path),
                 device=device,
                 dtype=dtype,
+                precision=cfg.train.precision,
             )
             # latents: (1, 16, 1, H, W) -> (16, H, W)
             pred = latents.squeeze(0).squeeze(1).to(torch.float32)

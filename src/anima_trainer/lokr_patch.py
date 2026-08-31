@@ -35,6 +35,7 @@ from lycoris.modules.lokr import LokrModule
 
 _PATCHED = False
 _ORIG_FORWARD = None
+_ORIG_CUSTOM_STATE_DICT = None
 # Module-global FP8 toggle. Flipped on by `enable_fp8()` when precision="fp8".
 # When True, `_patched_forward` swaps `F.linear(x, merged_W, bias)` for
 # `FP8LoKrLinear` — single FP8 GEMM forward + FP8 dgrad + FP8 wgrad. Only
@@ -48,6 +49,12 @@ def _patched_forward(self, x: torch.Tensor, *args, **kwargs):
     if self.module_dropout and self.training:
         if torch.rand(1) < self.module_dropout:
             return self.org_forward(x, *args, **kwargs)
+    if getattr(self, "_tlokr_enabled", False):
+        # T-LoKr owns a structured, per-sample timestep path. It must dispatch
+        # before the ordinary materialized/bypass branches below.
+        from .tlokr import forward as tlokr_forward
+
+        return tlokr_forward(self, x)
     if self.bypass_mode:
         return self.bypass_forward(x, self.multiplier)
     if self.wd:
@@ -87,6 +94,13 @@ def _patched_forward(self, x: torch.Tensor, *args, **kwargs):
     return self.op(x, merged_weight, org.bias, **self.kw_dict)
 
 
+def _patched_custom_state_dict(self):
+    state = _ORIG_CUSTOM_STATE_DICT(self)
+    if getattr(self, "_tlokr_enabled", False):
+        state["tlokr_schedule"] = self.tlokr_schedule
+    return state
+
+
 def _mark_fp8_eligible(network) -> int:
     """Tag each LokrModule whose wrapped Linear has both dims % 128 == 0
     (Float8BlockScaling block size) — only those modules can take the FP8
@@ -94,6 +108,9 @@ def _mark_fp8_eligible(network) -> int:
     count = 0
     for mod in network.modules():
         if not isinstance(mod, LokrModule):
+            continue
+        if getattr(mod, "_tlokr_enabled", False):
+            mod._fp8_ok = False
             continue
         inner = mod.org_module[0]
         # Only LoKr-wrapped nn.Linear is in scope; LoKr also wraps Conv2d
@@ -120,9 +137,11 @@ def enable_fp8(network) -> int:
 
 def install() -> None:
     """Apply the patch globally. Idempotent."""
-    global _PATCHED, _ORIG_FORWARD
+    global _PATCHED, _ORIG_FORWARD, _ORIG_CUSTOM_STATE_DICT
     if _PATCHED:
         return
     _ORIG_FORWARD = LokrModule.forward
+    _ORIG_CUSTOM_STATE_DICT = LokrModule.custom_state_dict
     LokrModule.forward = _patched_forward
+    LokrModule.custom_state_dict = _patched_custom_state_dict
     _PATCHED = True

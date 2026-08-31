@@ -516,6 +516,103 @@ def fp8_lokr_linear(x: torch.Tensor, merged_W: torch.Tensor, bias: torch.Tensor 
     return FP8LoKrLinear.apply(x, merged_W, bias)
 
 
+class FP8FrozenLinear(torch.autograd.Function):
+    """Frozen ``F.linear`` with a once-quantized FP8 block-scaled weight.
+
+    T-LoKr computes its trainable contribution with structured bf16 GEMMs, so
+    the base projection is genuinely frozen and never needs a wgrad.  Keeping
+    the weight quantized across steps removes both the full merged-weight
+    materialization and FP8 weight quantization performed by ordinary LoKr.
+    Forward and dgrad use Transformer Engine's fused block-scaled GEMMs.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight_q,
+        weight_bf16: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
+        xq = _FP8_X_QUANTIZER.quantize(x_2d.contiguous())
+        out = tex_ext.general_gemm(
+            weight_q,
+            xq,
+            out_dtype=x.dtype,
+            layout="TN",
+        )[0]
+        y = out.reshape(*x.shape[:-1], weight_bf16.shape[0])
+        if bias is not None:
+            y = y + bias
+        ctx.weight_q = weight_q
+        ctx.weight_bf16 = weight_bf16
+        ctx.has_bias = bias is not None
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y: torch.Tensor):
+        weight = ctx.weight_bf16
+        gy = grad_y.reshape(-1, grad_y.shape[-1]).to(weight.dtype).contiguous()
+        gy_q = _FP8_X_QUANTIZER.quantize(gy)
+        grad_x_2d = tex_ext.general_gemm(
+            ctx.weight_q,
+            gy_q,
+            out_dtype=weight.dtype,
+            layout="NN",
+        )[0]
+        grad_x = grad_x_2d.reshape(*grad_y.shape[:-1], weight.shape[1])
+        if grad_x.dtype != grad_y.dtype:
+            grad_x = grad_x.to(grad_y.dtype)
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_y.reshape(-1, grad_y.shape[-1]).sum(dim=0)
+        return grad_x, None, None, grad_bias
+
+
+def fp8_frozen_linear(
+    x: torch.Tensor,
+    weight_q,
+    weight_bf16: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Functional wrapper for :class:`FP8FrozenLinear`."""
+    return FP8FrozenLinear.apply(x, weight_q, weight_bf16, bias)
+
+
+def quantize_tlokr_base_weights(network: nn.Module) -> int:
+    """Prequantize every T-LoKr wrapped base Linear exactly once.
+
+    Float8BlockScaling requires both weight dimensions to be divisible by
+    128.  Anima's cross-attention and MLP targets all meet that contract; a
+    mismatch is an error instead of a silent precision/performance fallback.
+    """
+    from lycoris.modules.lokr import LokrModule
+
+    count = 0
+    for module in network.modules():
+        if not isinstance(module, LokrModule) or not getattr(
+            module, "_tlokr_enabled", False
+        ):
+            continue
+        if getattr(module, "_tlokr_fp8_base_weight", None) is not None:
+            continue
+        inner = module.org_module[0]
+        if not isinstance(inner, nn.Linear):
+            raise TypeError(f"{module.lora_name}: FP8 T-LoKr requires nn.Linear")
+        out_dim, in_dim = inner.weight.shape
+        if (out_dim % 128) or (in_dim % 128):
+            raise ValueError(
+                f"{module.lora_name}: FP8 T-LoKr base shape "
+                f"{tuple(inner.weight.shape)} is not 128-aligned"
+            )
+        module._tlokr_fp8_base_weight = _FP8_W_QUANTIZER.quantize(
+            inner.weight.detach().contiguous()
+        )
+        count += 1
+    return count
+
+
 def fp8_block_autocast():
     """Context manager that enables `te.fp8_autocast` with Float8BlockScaling.
 
