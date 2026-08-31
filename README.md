@@ -53,7 +53,7 @@ Edit `melted1.toml` (or copy and edit) — the user-facing knobs are:
 | `train.resolution` | 1024 | 512 or 1024 |
 | `train.batch_size` | 8 | |
 | `train.max_train_epochs` | 15 | |
-| `train.precision` | `"bf16"` | `"fp8"` for better perf |
+| `train.precision` | `"fp8"` | Fast production path; use `"bf16"` as the reference mode |
 | `train.seed` | 42 | |
 | `optim.d0` | 5e-05 | Prodigy+SF starting estimate; adapts upward automatically — leave alone |
 | `lokr.preset` | `"anima-cross-mlp"` | `"anima-cross-mlp"` (168 modules, fast) or `"anima-full"` (454 modules, higher capacity) |

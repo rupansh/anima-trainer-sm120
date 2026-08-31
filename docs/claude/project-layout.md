@@ -15,7 +15,7 @@ Built:
   - `adaln_patch.py` — monkey-patches `Block._forward` to call the custom Triton kernel from `adaln_kernel.py` (LayerNorm + (1+scale)*x + shift) instead of the inline lambda. Replaces the older `torch.compile` path.
   - `adaln_kernel.py` — custom Triton kernels (forward + dx + dscale/dshift) and `FusedAdaLN(torch.autograd.Function)` wrapper for the AdaLN fusion.
   - `optim.py` — Prodigy+SF with locked defaults; only `d0` exposed.
-  - `precision.py` — autocast wrapper; only `bf16` is implemented. `quantize_dit_in_place` is a no-op kept for call-site compatibility (mxfp8/nvfp4 removed).
+  - `precision.py` — autocast wrapper for `bf16`, `mxfp8`, and `fp8`; the quantized execution implementations live in `fp8_quant.py` and the merged adapted-linear route is selected through `lokr_patch.py`.
   - `flow.py` — sigmoid timestep sampling + rectified-flow target.
   - `preprocess.py` — smartcrop+bucket; writes JPEGs into `crops` table.
   - `encode.py` — VAE / Qwen3 encoding with cache fronting.
@@ -46,12 +46,16 @@ Built:
 
 Open follow-ups (in rough leverage order):
 
-- **`aten::copy_` ~184 ms/step lead** — the profile shows ~7% of step time in dtype/layout copies. Best guess: fp32→bf16 cast on the LokrModule diff weight + autograd saved-tensor materialization for backward. Cheapest probe: `stochastic_rounding=True` already on in Prodigy+SF; check if optimizer state can stay bf16 via that path. Estimate: ~5% if the cast turns out to be eliminable.
-- **fp8 GEMMs via SGLang's CUTLASS sm120 kernel** (`sgl-kernel`, `torch.ops.sgl_kernel.fp8_scaled_mm.default`, PR #9969 merged 2025-09-07). Inference-only blockwise fp8 (both inputs fp8). For training: wrap in autograd.Function + decide full-fp8 vs weight-only. Realistic projection: 15-20% on top of current 2.55 s (~50% of step is `aten::mm`; ~1.5× speedup on that portion is typical real-world fp8). 1-2 days of engineering + a numerical-parity convergence gate. **Not the dead end the earlier "Quantization libraries surveyed" section implied — see the SGLang note in `attention-sm120.md` for the corrected framing.**
-- **CUDA graphs per bucket** — ~3000 kernel launches/step, many in small launch-bound elementwise kernels at ~20% HBM-BW utilization. Capture once per bucket → ~5-10% on steady-state. Requires static input tensor addresses and pre-allocated bucket buffers. High complexity.
-- **Block-level fusion** — AdaLN is now a custom Triton kernel; the next-wider fusion target is `Block._forward` itself. Options: (a) hand-written Triton over the whole block (high effort), or (b) `torch.compile(Block._forward)` which gives one compiled graph per block — should sidestep the 77 GB / 124 s pathology since the scope is tiny. ~5-15% unverified.
-- **`torch.backends.cudnn.benchmark = True`** — one line; lets cuDNN autotune kernel variants per shape, fixed buckets make this safe. Possibly 0-3%.
-- **Convergence parity** — at 30 epochs the LoKr's mean latent-cosine is ~0.51 (style hasn't visibly appeared in samples for either sd-scripts or us). Per user, grokking is significant with Anima DiT — typically needs 30-40+ epochs. Levers: larger LoKr (`preset = "anima-full"`), longer training, better caption hygiene for multi-character setups.
+- **Profile the remaining copy/quantize traffic in the full FP8 step.** The current merged adapted-linear path is already the fastest tested route. Attribute copies to exact call sites before attempting another kernel; the old profile's blanket `aten::copy_` estimate predates production FP8.
+- **Grouped self-QKV with one activation quantization.** A low-level TE grouped-GEMM probe was 5.339 → 5.085 ms for QKV forward+dgrad with exact output/dgrad parity, but projects to only ~0.3% of a 2.23 s step and did not clear a full-block acceptance run. Do not enable it without a stable full-block and full-step win.
+- **Time-to-quality initialization experiment.** EVA/PiSSA/LoRA-GA/IPA may reduce steps-to-quality for ordinary LoRA, but ordinary two-branch LoRA was ~8% slower per block here. A comparable LoKr initializer needs a fixed-seed convergence gate; initialization claims are not throughput claims.
+- **Convergence parity.** At 30 epochs the LoKr's mean latent-cosine is ~0.51 (style hasn't visibly appeared in samples for either sd-scripts or us). Per user, grokking is significant with Anima DiT — typically needs 30-40+ epochs. Levers: larger LoKr (`preset = "anima-full"`), longer training, better caption hygiene for multi-character setups.
+
+Measured rejects as of 2026-08-31: per-block regional `torch.compile`, CUDA
+graph replay, upstream wide self-QKV fusion, ordinary two-branch LoRA,
+structured LoKr base/delta bypass, reusing saved FP8 representations, and a
+Transformer Engine 2.18 upgrade for GEMM speed. See
+`sm120-optimization-audit-2026-08.md` for numbers and scope.
 
 Dead ends (don't re-investigate without new evidence): see `attention-sm120.md` and `quantization.md`.
 

@@ -1,7 +1,7 @@
 # torch.compile
 
 The trainer **does not use `torch.compile`** in production. This file
-documents the two scopes that were investigated and rejected.
+documents the scopes that were investigated and rejected.
 
 ## Whole-DiT compile (`train.compile_mode = "default"` etc.) — **not used in production**
 
@@ -44,3 +44,14 @@ That path was replaced by a hand-written Triton kernel in
 `src/anima_trainer/adaln_kernel.py` — same speed at the production shape,
 no inductor warmup per bucket, explicit backward. See `patches.md` →
 "AdaLN custom kernel" for the kernel design and microbench numbers.
+
+## Regional per-block compile — rejected on production FP8/LoKr
+
+The regional-compile strategy used by upstream `anima_lora` was also tested
+on an actual Anima block with the production patches, sequence shapes, and
+merged block-scaled-FP8 LoKr path. Eager was **58.595 ms** and compiled was
+**58.777 ms**. Compiling one block took about 8.8 seconds and peaked around
+9.2 GB during the isolated test. Transformer Engine quantization and
+`general_gemm` calls create graph boundaries, leaving Inductor no useful
+region to fuse. Do not retry regional compile unless TE exposes a materially
+different compiler-visible execution path.

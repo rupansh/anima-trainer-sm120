@@ -19,13 +19,12 @@ resolution               = 1024
 batch_size               = 8
 max_train_epochs         = 15
 save_every_n_epochs      = 15
-precision                = "bf16"
+precision                = "fp8"
 seed                     = 42
 gradient_checkpointing   = true
 num_workers              = 4
-# "default" gets ~1.7× more throughput than eager but pays 83 s warmup + ~70 s
-# per unique sample bucket. For dev iteration / short runs set this to "" —
-# TritonMXFP8Linear is eager-fast (0.76 s/step) without compile.
+# Whole-DiT and regional compile were neutral/slower on the production FP8
+# LoKr path and add shape warmup. Keep eager unless the execution stack changes.
 compile_mode             = ""
 
 [optim]

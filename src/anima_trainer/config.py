@@ -55,15 +55,13 @@ class TrainCfg:
     batch_size: int = 8
     max_train_epochs: int = 30
     save_every_n_epochs: int = 2
-    precision: Precision = "bf16"
+    precision: Precision = "fp8"
     seed: int = 42
     gradient_checkpointing: bool = True
     num_workers: int = 8
-    # When True, capture one CUDA graph per (bucket_shape, batch_size) after
-    # warm-up steps and replay it on subsequent iterations. Eliminates per-
-    # step Python + kernel-launch overhead. Compatible with FP8 / LoKr /
-    # SAC. Adds minimal VRAM (the captured op stream reuses the training
-    # allocator via a shared memory pool).
+    # Experimental: capture one CUDA graph per (bucket_shape, batch_size).
+    # The production FP8/LoKr block benchmark was flat (58.923 vs 58.943 ms),
+    # so keep this disabled unless a changed stack wins a full-step A/B.
     cuda_graphs: bool = False
     # Number of warm-up steps per bucket before capture. 3 is enough for
     # cuDNN to pick a final algorithm and for Triton autotune to settle.

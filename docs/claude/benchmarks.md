@@ -23,7 +23,7 @@ modules / 30.6 M params). `anima-cross-mlp` is the focused subset
 modules / 20.2 M params) — the highest-leverage targeting for
 multi-character / multi-style LoRAs.
 
-| metric             | sd-scripts | full+lokr_patch | +cross-mlp | +Liger | **+AdaLN-compile** |
+| metric             | sd-scripts | full+lokr_patch | +cross-mlp | +Liger | **+AdaLN fusion** |
 |--------------------|------------|-----------------|------------|--------|---------------------|
 | step time (steady) | 5.32 s     | 3.65 s          | 3.27 s     | 2.85 s | **2.55 s** (2.09× vs sd-scripts) |
 | epoch time (warm)  | ~38 s      | 26.7 s          | ~23.5 s    | ~21.5 s| **~19.8 s**         |
@@ -38,19 +38,21 @@ Decomposition of the wide-LoRA → production gap (3.65 → 2.55 s = 30%):
 - Liger fused RMSNorm: **~13%** (3.27 → 2.85 s). Replaces 113 autocast(fp32)
   round-trips per forward (4 RMSNorms × 28 blocks + t_embedding_norm) with
   single-kernel-launch Triton calls. Loss bit-identical.
-- AdaLN compile patch: **~10%** (2.85 → 2.55 s). Hoists Anima's inline
-  `_adaln_fn(x, norm, scale, shift) = norm(x) * (1+scale) + shift` to a
-  module-level pure function, wraps it with `torch.compile(fullgraph=True)`
-  so inductor fuses the 3 ops into one Triton kernel. 84 sites × 3 ops = 252
-  launches collapse to 84. Loss bit-identical on cached training data.
-  First step pays ~700 ms compile warmup (the compiled region is tiny — no
-  LoKr inside — so none of the 124 s / 77 GB pathology from compiling the
-  full DiT applies).
+- AdaLN fusion patch: **~10%** (2.85 → 2.55 s in the historical bf16 run).
+  It replaces Anima's inline `_adaln_fn(x, norm, scale, shift) = norm(x) *
+  (1+scale) + shift` with the explicit Triton forward/backward kernel in
+  `adaln_kernel.py`. 84 sites × 3 ops collapse to 84 launches. Loss is
+  bit-identical on cached training data, with no per-bucket Inductor warmup.
 
 All three effects are independent and compose. Current production defaults
 in `melted1.toml`. The `anima-full` preset is still available for runs that
 need maximum capacity (single-style, single-character, very high-detail
 training); pass `preset = "anima-full"` in the TOML for the wide-LoRA path.
+
+The later precision A/B at the same batch-8 production shape measured
+**~2.23 s/step with Transformer Engine block-scaled FP8 versus ~2.52 s/step
+with bf16**. See `sm120-optimization-audit-2026-08.md` for the subsequent
+upstream/research audit and rejected execution variants.
 
 For per-patch implementation notes, see `patches.md`. For the
 broader compile-scope discussion (whole-DiT vs targeted), see
