@@ -128,13 +128,14 @@ def attach_lokr(
         # is already efficient on Anima's shapes.
     )
     if cfg.variant == "tlokr":
-        from .tlokr import convert_network
+        from .tlokr import convert_network, install_root_timestep_hooks
 
         converted = convert_network(
             network,
             rank=network_dim,
             min_rank_ratio=cfg.timestep_min_rank_ratio,
         )
+        install_root_timestep_hooks(dit)
         network._tlokr_converted_modules = converted
     network.apply_to(text_encoder, dit, apply_text_encoder=False, apply_unet=True)
     network.requires_grad_(True)

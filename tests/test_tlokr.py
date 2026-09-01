@@ -4,13 +4,18 @@ import unittest
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from anima_trainer.convergence import _sample_seed
 from anima_trainer.lokr_patch import install
 from anima_trainer.tlokr import (
+    _capture_timestep_callable,
+    _current_state,
+    _install_block_checkpoint_patch,
     active_rank_for_timestep,
     clear_timestep,
     convert_network,
+    install_root_timestep_hooks,
     set_timestep,
 )
 from anima_trainer.tlokr_kernels import rank_mix, rank_mix_wgrad
@@ -205,6 +210,162 @@ class TLoKrForwardTests(unittest.TestCase):
         _, adapter, _ = _make_module()
         with self.assertRaisesRegex(RuntimeError, "no timestep context"):
             adapter(torch.randn(1, 16))
+
+    def test_root_hook_derives_positional_timestep_and_cleans_up(self) -> None:
+        _, adapter, _ = _make_module()
+        with torch.no_grad():
+            adapter.lokr_w2_b.normal_(mean=0.0, std=0.2)
+
+        class ToyDiT(torch.nn.Module):
+            def __init__(self, layer: torch.nn.Module) -> None:
+                super().__init__()
+                self.layer = layer
+
+            def forward(self, x: torch.Tensor, timesteps: torch.Tensor):
+                return self.layer(x)
+
+        dit = ToyDiT(adapter)
+        install_root_timestep_hooks(dit)
+        x = torch.randn(2, 3, 16)
+        timesteps = torch.tensor([0.25, 0.75])
+
+        set_timestep(timesteps)
+        expected = adapter(x)
+        clear_timestep()
+        actual = dit(x, timesteps)
+        torch.testing.assert_close(actual, expected)
+
+        with self.assertRaisesRegex(RuntimeError, "no timestep context"):
+            adapter(x)
+
+    def test_root_hook_accepts_keyword_and_preserves_explicit_context(self) -> None:
+        _, adapter, _ = _make_module()
+
+        class ToyDiT(torch.nn.Module):
+            def __init__(self, layer: torch.nn.Module) -> None:
+                super().__init__()
+                self.layer = layer
+
+            def forward(self, x: torch.Tensor, timesteps: torch.Tensor):
+                return self.layer(x)
+
+        dit = ToyDiT(adapter)
+        install_root_timestep_hooks(dit)
+        install_root_timestep_hooks(dit)  # idempotent
+        x = torch.randn(1, 16)
+        explicit = torch.tensor([0.0])
+        set_timestep(explicit)
+        dit(x=x, timesteps=torch.tensor([1.0]))
+
+        # The hook must not clear the explicit training context.
+        adapter(x)
+
+    def test_root_hook_cleans_up_after_failed_forward(self) -> None:
+        _, adapter, _ = _make_module()
+
+        class FailingDiT(torch.nn.Module):
+            def forward(self, x: torch.Tensor, timesteps: torch.Tensor):
+                adapter(x)
+                raise ValueError("probe")
+
+        dit = FailingDiT()
+        install_root_timestep_hooks(dit)
+        with self.assertRaisesRegex(ValueError, "probe"):
+            dit(torch.randn(1, 16), torch.tensor([0.5]))
+        with self.assertRaisesRegex(RuntimeError, "no timestep context"):
+            adapter(torch.randn(1, 16))
+
+    def test_captured_context_survives_checkpoint_recomputation(self) -> None:
+        _, adapter, _ = _make_module()
+        with torch.no_grad():
+            adapter.lokr_w2_b.normal_(mean=0.0, std=0.2)
+        x = torch.randn(2, 3, 16, requires_grad=True)
+        timesteps = torch.tensor([0.2, 0.8])
+
+        set_timestep(timesteps)
+        contextual_adapter = _capture_timestep_callable(
+            adapter,
+            _current_state(),
+        )
+        output = checkpoint(contextual_adapter, x, use_reentrant=False)
+        # Root execution has ended before non-reentrant checkpointing reruns
+        # the adapter in backward.
+        clear_timestep()
+        output.square().mean().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+
+    def test_anima_block_checkpoint_retains_timestep_context(self) -> None:
+        from anima_trainer.sdscripts_bridge import ensure_on_path
+
+        ensure_on_path()
+        from library.anima_models import Block
+
+        _install_block_checkpoint_patch()
+        _, adapter, _ = _make_module()
+        with torch.no_grad():
+            adapter.lokr_w2_b.normal_(mean=0.0, std=0.2)
+
+        # Build the smallest possible Block shell around a T-LoKr adapter. Its
+        # real forward owns checkpoint selection; the instance _forward keeps
+        # this regression independent of attention/AdaLN compute.
+        block = Block.__new__(Block)
+        torch.nn.Module.__init__(block)
+        block.adapter = adapter
+        block.gradient_checkpointing = True
+        block.unsloth_offload_checkpointing = False
+        block.cpu_offload_checkpointing = False
+        block.train()
+
+        def adapter_forward(x: torch.Tensor, *_args):
+            return block.adapter(x)
+
+        object.__setattr__(block, "_forward", adapter_forward)
+        x = torch.randn(2, 3, 16, requires_grad=True)
+        set_timestep(torch.tensor([0.3, 0.7]))
+        output = block(x, None, None, None, False, None, None, None)
+        clear_timestep()
+        output.square().mean().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+
+    def test_anima_execution_boundary_derives_and_cleans_context(self) -> None:
+        _, adapter, _ = _make_module()
+        with torch.no_grad():
+            adapter.lokr_w2_b.normal_(mean=0.0, std=0.2)
+
+        class ToyAnima(torch.nn.Module):
+            def __init__(self, layer: torch.nn.Module) -> None:
+                super().__init__()
+                self.layer = layer
+
+            def forward_mini_train_dit(
+                self,
+                x: torch.Tensor,
+                timesteps: torch.Tensor,
+            ):
+                return self.layer(x)
+
+            def forward(self, x: torch.Tensor, timesteps: torch.Tensor):
+                return self.forward_mini_train_dit(x, timesteps)
+
+        dit = ToyAnima(adapter)
+        install_root_timestep_hooks(dit)
+        x = torch.randn(2, 3, 16)
+        timesteps = torch.tensor([0.1, 0.9])
+
+        set_timestep(timesteps)
+        expected = adapter(x)
+        clear_timestep()
+        torch.testing.assert_close(dit(x, timesteps), expected)
+        torch.testing.assert_close(
+            dit.forward_mini_train_dit(x, timesteps),
+            expected,
+        )
+        with self.assertRaisesRegex(RuntimeError, "no timestep context"):
+            adapter(x)
 
     def test_state_dict_round_trip_preserves_tlokr_topology(self) -> None:
         network, adapter, _ = _make_module()

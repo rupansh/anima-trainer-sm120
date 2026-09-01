@@ -25,6 +25,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import math
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -94,6 +95,16 @@ class _TimestepState:
 _TIMESTEP_STATE: ContextVar[_TimestepState | None] = ContextVar(
     "anima_tlokr_timestep_state", default=None
 )
+# Root-forward hooks use a per-context stack so nested/concurrent DiT calls
+# restore exactly the context they inherited. A ``None`` entry means the
+# caller had already installed an explicit context (training and the optimized
+# sampler do this), so the hook must leave it live after the forward returns.
+_AUTO_HOOK_TOKENS: ContextVar[tuple[object | None, ...]] = ContextVar(
+    "anima_tlokr_auto_hook_tokens", default=()
+)
+_ORIGINAL_BLOCK_FORWARD = None
+_BLOCK_FORWARD_PATCHED = False
+_MISSING = object()
 
 
 def set_timestep(
@@ -117,6 +128,168 @@ def set_timestep(
 def clear_timestep() -> None:
     """Clear the current T-LoKr timestep context."""
     _TIMESTEP_STATE.set(None)
+
+
+def _root_timestep_pre_hook(
+    _module: nn.Module,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
+    """Derive an inference context from the root Anima forward arguments."""
+    token = None
+    if _TIMESTEP_STATE.get() is None:
+        timesteps = None
+        for name in ("timesteps", "timesteps_B_T", "timestep"):
+            candidate = kwargs.get(name)
+            if candidate is not None:
+                timesteps = candidate
+                break
+        if timesteps is None and len(args) >= 2:
+            timesteps = args[1]
+        if not torch.is_tensor(timesteps):
+            raise RuntimeError(
+                "T-LoKr could not derive a tensor timestep from the DiT "
+                "forward arguments"
+            )
+        token = _TIMESTEP_STATE.set(_TimestepState(timesteps=timesteps))
+
+    stack = _AUTO_HOOK_TOKENS.get()
+    _AUTO_HOOK_TOKENS.set(stack + (token,))
+
+
+def _root_timestep_post_hook(
+    _module: nn.Module,
+    _args: tuple[object, ...],
+    _kwargs: dict[str, object],
+    _output: object,
+) -> None:
+    """Restore the context that preceded the matching root forward."""
+    stack = _AUTO_HOOK_TOKENS.get()
+    if not stack:
+        return
+    token = stack[-1]
+    _AUTO_HOOK_TOKENS.set(stack[:-1])
+    if token is not None:
+        _TIMESTEP_STATE.reset(token)
+
+
+def _capture_timestep_callable(function, state: _TimestepState):
+    """Capture ``state`` for activation-checkpoint recomputation."""
+
+    def contextual_call(*args, **kwargs):
+        if _TIMESTEP_STATE.get() is not None:
+            return function(*args, **kwargs)
+        token = _TIMESTEP_STATE.set(state)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _TIMESTEP_STATE.reset(token)
+
+    return contextual_call
+
+
+def _block_forward_with_timestep_context(self, *args, **kwargs):
+    """Make the callable retained by Anima checkpointing context-complete."""
+    state = _TIMESTEP_STATE.get()
+    if (
+        state is None
+        or not self.training
+        or not getattr(self, "gradient_checkpointing", False)
+    ):
+        return _ORIGINAL_BLOCK_FORWARD(self, *args, **kwargs)
+
+    # Upstream Block.forward passes ``self._forward`` to one of three
+    # checkpoint implementations. Temporarily shadow that bound method with a
+    # closure carrying this forward's exact timestep state. The checkpoint
+    # object retains the closure after the instance attribute is restored, so
+    # recomputation works without leaking state between root forwards.
+    previous = self.__dict__.get("_forward", _MISSING)
+    contextual_forward = _capture_timestep_callable(self._forward, state)
+    object.__setattr__(self, "_forward", contextual_forward)
+    try:
+        return _ORIGINAL_BLOCK_FORWARD(self, *args, **kwargs)
+    finally:
+        if previous is _MISSING:
+            object.__delattr__(self, "_forward")
+        else:
+            object.__setattr__(self, "_forward", previous)
+
+
+def _install_block_checkpoint_patch() -> None:
+    """Preserve T-LoKr context across all Anima checkpoint backends."""
+    global _BLOCK_FORWARD_PATCHED, _ORIGINAL_BLOCK_FORWARD
+    if _BLOCK_FORWARD_PATCHED:
+        return
+    try:
+        from library.anima_models import Block  # type: ignore
+    except ModuleNotFoundError:
+        # Generic unit-test/third-party roots can still use the root hooks;
+        # the Anima module is guaranteed to be importable in attach_lokr().
+        return
+
+    _ORIGINAL_BLOCK_FORWARD = Block.forward
+    Block.forward = _block_forward_with_timestep_context
+    _BLOCK_FORWARD_PATCHED = True
+
+
+def _install_anima_execution_boundary(dit: nn.Module) -> bool:
+    """Wrap Anima's direct mini-DiT entry point when it is available."""
+    if not hasattr(dit, "forward_mini_train_dit"):
+        return False
+    if getattr(dit, "_tlokr_execution_boundary_installed", False):
+        return True
+
+    original = dit.forward_mini_train_dit
+
+    def contextual_forward_mini(
+        _self: nn.Module,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        *args,
+        **kwargs,
+    ):
+        if _TIMESTEP_STATE.get() is not None:
+            return original(x, timesteps, *args, **kwargs)
+        if not torch.is_tensor(timesteps):
+            raise TypeError("T-LoKr Anima timesteps must be a torch.Tensor")
+        token = _TIMESTEP_STATE.set(_TimestepState(timesteps=timesteps))
+        try:
+            return original(x, timesteps, *args, **kwargs)
+        finally:
+            _TIMESTEP_STATE.reset(token)
+
+    object.__setattr__(
+        dit,
+        "forward_mini_train_dit",
+        MethodType(contextual_forward_mini, dit),
+    )
+    dit._tlokr_execution_boundary_installed = True
+    return True
+
+
+def install_root_timestep_hooks(dit: nn.Module) -> None:
+    """Make Anima execution and checkpoint recomputation T-LoKr-aware.
+
+    The automatically derived context is scoped to Anima's real execution
+    boundary. Activation-checkpoint callables capture that state so block
+    recomputation during backward restores it without a stale global context.
+    Explicit trainer/sampler contexts always take precedence.
+    """
+    _install_block_checkpoint_patch()
+    if not _install_anima_execution_boundary(dit):
+        if getattr(dit, "_tlokr_timestep_hooks_installed", False):
+            return
+        pre_handle = dit.register_forward_pre_hook(
+            _root_timestep_pre_hook,
+            with_kwargs=True,
+        )
+        post_handle = dit.register_forward_hook(
+            _root_timestep_post_hook,
+            with_kwargs=True,
+            always_call=True,
+        )
+        dit._tlokr_timestep_hook_handles = (pre_handle, post_handle)
+        dit._tlokr_timestep_hooks_installed = True
 
 
 def _current_state() -> _TimestepState:

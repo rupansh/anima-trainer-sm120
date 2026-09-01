@@ -95,6 +95,12 @@ its weight gradient. Sampling slices inactive factor columns out entirely.
 Saved adapters include a format marker and schedule parameters, so strict loads
 cannot silently interpret T-LoKr weights as ordinary LoKr.
 
+Calling the attached DiT normally as `dit(x, timesteps, ...)` automatically
+scopes the T-LoKr rank schedule to that forward. Low-level calls to an adapter
+module still require `set_timestep()`/`clear_timestep()` explicitly; training
+with activation checkpointing captures the same context for block
+recomputation during backward.
+
 ### Crash recovery
 
 Every adapter checkpoint also publishes a full resumable training state under
